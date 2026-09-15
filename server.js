@@ -298,6 +298,17 @@ const connectToDatabase = async () => {
       );
     }
 
+    // Atlas aborts the TLS handshake (instead of replying with a clean error)
+    // when the connecting IP is not allowed, which surfaces as:
+    //   "tlsv1 alert internal error: SSL alert number 80"
+    if (/ssl alert|tlsv1 alert|ssl3_read_bytes|internal error/i.test(err.message)) {
+      console.error(
+        '   ↳ TLS handshake was aborted by MongoDB Atlas. This is almost always the\n' +
+        '     IP Access List: open Atlas → Network Access → Add IP Address →\n' +
+        '     "Allow Access from Anywhere" (0.0.0.0/0) so Render can connect.'
+      );
+    }
+
     if (/Invalid scheme|Invalid connection string|must be a string/i.test(err.message)) {
       console.error(
         '   ↳ MONGODB_URI is malformed. On Render it must be the plain string\n' +
