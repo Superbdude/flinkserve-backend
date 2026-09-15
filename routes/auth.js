@@ -3,6 +3,7 @@ const jwt = require('jsonwebtoken');
 const { body, validationResult } = require('express-validator');
 const User = require('../models/User');
 const { protect } = require('../middleware/auth');
+const { verifySocialToken } = require('../utils/socialAuth');
 
 const router = express.Router();
 
@@ -395,6 +396,98 @@ router.post('/logout', protect, (req, res) => {
     success: true,
     message: 'Logged out successfully'
   });
+});
+
+// @desc    Authenticate (or sign up) with Google / Facebook
+// @route   POST /api/auth/social
+// @access  Public
+router.post('/social', [
+  body('provider')
+    .isIn(['google', 'facebook'])
+    .withMessage('Provider must be either google or facebook'),
+  body('role')
+    .optional()
+    .isIn(['service_seeker', 'service_provider'])
+    .withMessage('Role must be either service_seeker or service_provider')
+], async (req, res, next) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Validation failed',
+        errors: errors.array()
+      });
+    }
+
+    const { provider, idToken, accessToken, role } = req.body;
+
+    // 1. Verify the credential with the provider itself.
+    let profile;
+    try {
+      profile = await verifySocialToken(provider, { idToken, accessToken });
+    } catch (verificationError) {
+      return res.status(verificationError.statusCode || 401).json({
+        success: false,
+        message: verificationError.message || 'Social sign-in failed'
+      });
+    }
+
+    // Facebook users may not share an email address. Fall back to a stable
+    // placeholder so the unique email requirement is still satisfied.
+    const email = profile.email || `${provider}_${profile.providerId}@social.flinkserve.local`;
+
+    // 2. Look the account up by provider id, then by email (account linking).
+    let user = await User.findOne({ authProvider: provider, providerId: profile.providerId });
+    let isNewUser = false;
+
+    if (!user && profile.email) {
+      user = await User.findOne({ email });
+      if (user) {
+        // Existing local account with the same verified email — link it so the
+        // user can sign in with either method from now on.
+        user.authProvider = provider;
+        user.providerId = profile.providerId;
+        if (!user.avatar && profile.avatar) user.avatar = profile.avatar;
+        await user.save();
+      }
+    }
+
+    // 3. Create the account when this is a first-time social sign-in.
+    if (!user) {
+      isNewUser = true;
+      user = await User.create({
+        name: profile.name,
+        email,
+        avatar: profile.avatar || null,
+        role: role || 'service_seeker',
+        authProvider: provider,
+        providerId: profile.providerId,
+        emailVerified: Boolean(profile.emailVerified),
+        lastLogin: new Date()
+      });
+    } else {
+      if (!user.isActive) {
+        return res.status(401).json({
+          success: false,
+          message: 'Account has been deactivated. Please contact support.'
+        });
+      }
+      user.lastLogin = new Date();
+      await user.save();
+    }
+
+    const token = generateToken(user._id);
+
+    return res.status(isNewUser ? 201 : 200).json({
+      success: true,
+      message: isNewUser ? 'Account created successfully' : 'Login successful',
+      isNewUser,
+      data: { user, token }
+    });
+  } catch (error) {
+    return next(error);
+  }
 });
 
 module.exports = router;

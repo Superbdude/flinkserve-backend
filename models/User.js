@@ -18,21 +18,40 @@ const userSchema = new mongoose.Schema({
   },
   phone: {
     type: String,
-    required: [true, 'Phone number is required'],
+    // Only required for email/password accounts. Google/Facebook users may not
+    // expose a phone number, so requiring it would block their signup.
+    required: function() {
+      return this.authProvider === 'local';
+    },
     validate: {
       validator: function(v) {
+        if (v === undefined || v === null || v === '') return true;
         // More flexible phone validation - supports international formats
         // Allows numbers with or without + prefix, 7-15 digits total
-        return /^\+?[0-9]{7,15}$/.test(v.replace(/[\s-()]/g, ''));
+        return /^\+?[0-9]{7,15}$/.test(String(v).replace(/[\s-()]/g, ''));
       },
       message: 'Please provide a valid phone number (7-15 digits, optionally starting with +)'
     }
   },
   password: {
     type: String,
-    required: [true, 'Password is required'],
+    // Social accounts authenticate through their provider, not a password.
+    required: function() {
+      return this.authProvider === 'local';
+    },
     minlength: [6, 'Password must be at least 6 characters'],
     select: false // Don't include password in queries by default
+  },
+  // How this account authenticates: local = email + password
+  authProvider: {
+    type: String,
+    enum: ['local', 'google', 'facebook'],
+    default: 'local'
+  },
+  // The provider's unique user id (Google "sub", Facebook "id")
+  providerId: {
+    type: String,
+    default: null
   },
   role: {
     type: String,
@@ -46,16 +65,23 @@ const userSchema = new mongoose.Schema({
   location: {
     address: {
       type: String,
-      required: [true, 'Address is required']
+      // Required for local signups only; social signups may fill this in later.
+      required: function() {
+        return this.authProvider === 'local';
+      }
     },
     coordinates: {
       lat: {
         type: Number,
-        required: true
+        required: function() {
+          return this.authProvider === 'local';
+        }
       },
       lng: {
         type: Number,
-        required: true
+        required: function() {
+          return this.authProvider === 'local';
+        }
       }
     },
     city: String,
@@ -130,6 +156,8 @@ const userSchema = new mongoose.Schema({
 // Indexes
 userSchema.index({ 'location.coordinates': '2dsphere' });
 userSchema.index({ role: 1 });
+// Fast lookup for social sign-ins
+userSchema.index({ authProvider: 1, providerId: 1 });
 
 // Virtual for services count (for providers)
 userSchema.virtual('servicesCount', {
@@ -141,7 +169,8 @@ userSchema.virtual('servicesCount', {
 
 // Hash password before saving
 userSchema.pre('save', async function(next) {
-  if (!this.isModified('password')) return next();
+  // Social accounts have no password to hash.
+  if (!this.password || !this.isModified('password')) return next();
   
   try {
     const salt = await bcrypt.genSalt(12);
@@ -154,6 +183,8 @@ userSchema.pre('save', async function(next) {
 
 // Compare password method
 userSchema.methods.comparePassword = async function(candidatePassword) {
+  // Social accounts cannot log in with a password.
+  if (!this.password) return false;
   return await bcrypt.compare(candidatePassword, this.password);
 };
 
