@@ -196,7 +196,10 @@ const SERVICES = [
     features: ['Past questions included', 'Progress reports', 'Flexible scheduling', 'Online option'],
     tags: ['tutoring', 'maths', 'waec', 'jamb'],
     address: '8 Admiralty Way, Lekki Phase 1, Lagos',
-    {
+    coordinates: { lat: 6.4406, lng: 3.4855 },
+    providerIndex: 2
+  },
+  {
     title: 'Event & Portrait Photography',
     description:
       'Full-day event coverage or studio-quality portraits. Package includes a professional photographer, edited high-resolution images delivered within 7 days, and a shared online gallery.',

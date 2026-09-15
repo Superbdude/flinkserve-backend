@@ -185,7 +185,12 @@ app.get('/health', async (req, res) => {
       name: mongoose.connection.name || null,
       // A missing host almost always means the Atlas IP allow-list is blocking
       // this server, or MONGODB_URI is not set correctly on the host.
-      configured: Boolean(process.env.MONGODB_URI)
+      configured: Boolean(process.env.MONGODB_URI),
+      // Surfaced here (instead of only in the Render log) so a 503 from any API
+      // route can be diagnosed straight from the browser.
+      lastError: mongoose.connection.readyState === 1
+        ? null
+        : (mongoose.__lastConnectError || null)
     }
   });
 });
@@ -208,28 +213,120 @@ app.use(errorHandler);
 // The server keeps listening regardless, so a transient Atlas hiccup never
 // leaves the platform returning 502 for every request.
 // ---------------------------------------------------------------------------
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/flinkserve';
+// ---------------------------------------------------------------------------
+// Normalise the connection string.
+//
+// Hosting dashboards happily store a value that still has the quotes from a
+// .env file, e.g.  MONGODB_URI="mongodb+srv://user:pass@host/db"
+// The MongoDB driver then rejects it with:
+//   "Invalid scheme, expected connection string to start with mongodb://"
+// Stripping wrapping quotes (and stray whitespace / trailing semicolons) makes
+// pasting straight from .env safe and removes a very common deploy failure.
+// ---------------------------------------------------------------------------
+const sanitizeMongoUri = (value) => {
+  if (!value) return value;
+  let uri = String(value).trim();
+
+  // Remove matching leading/trailing single or double quotes (repeat in case of
+  // nested quoting like ""mongodb://..."").
+  let previous;
+  do {
+    previous = uri;
+    if (
+      (uri.startsWith('"') && uri.endsWith('"')) ||
+      (uri.startsWith("'") && uri.endsWith("'"))
+    ) {
+      uri = uri.slice(1, -1).trim();
+    }
+  } while (uri !== previous && uri.length > 1);
+
+  // A trailing semicolon copied from a shell command would also break parsing.
+  uri = uri.replace(/;+$/, '').trim();
+
+  return uri;
+};
+
+const RAW_MONGODB_URI = process.env.MONGODB_URI;
+const MONGODB_URI = sanitizeMongoUri(RAW_MONGODB_URI) || 'mongodb://localhost:27017/flinkserve';
+
+if (RAW_MONGODB_URI && RAW_MONGODB_URI !== MONGODB_URI) {
+  console.warn('⚠️  MONGODB_URI contained surrounding quotes/whitespace — cleaned automatically.');
+}
+
+// Redact credentials before ever printing a URI.
+const maskUri = (uri) =>
+  uri.replace(/\/\/([^:]+):([^@]+)@/, '//$1:****@');
 
 mongoose.set('strictQuery', true);
 
-mongoose.connect(MONGODB_URI, {
+// Records the most recent connection failure so /health can explain a 503.
+mongoose.__lastConnectError = null;
+
+const connectOptions = {
   serverSelectionTimeoutMS: 15000,
   socketTimeoutMS: 45000,
   maxPoolSize: 10
-})
-.then(() => {
-  console.log('✅ Connected to MongoDB');
-})
-.catch((error) => {
-  // Do NOT process.exit() here — that is what turns a DB blip into a hard 502
-  // outage. Mongoose keeps retrying in the background.
-  console.error('❌ MongoDB initial connection error:', error.message);
-});
+};
 
-mongoose.connection.on('connected', () => console.log('✅ MongoDB connection established'));
-mongoose.connection.on('disconnected', () => console.warn('⚠️  MongoDB disconnected — will retry'));
+// Retry with capped backoff. Render keeps the service running between attempts
+// so the app self-heals once the database becomes reachable again (a corrected
+// env var requires a redeploy, but a transient Atlas blip / IP warm-up does not).
+let connectAttempt = 0;
+const MAX_BACKOFF_MS = 30000;
+
+const connectToDatabase = async () => {
+  connectAttempt += 1;
+
+  if (connectAttempt > 1) {
+    console.log(`🔄 MongoDB reconnect attempt #${connectAttempt}`);
+  }
+
+  try {
+    await mongoose.connect(MONGODB_URI, connectOptions);
+    connectAttempt = 0;
+    return true;
+  } catch (err) {
+    mongoose.__lastConnectError = err.message;
+    console.error(`❌ MongoDB connection failed (attempt ${connectAttempt}): ${err.message}`);
+
+    // Extremely common on first deploy: the URI is fine but Atlas' Network
+    // Access list does not include the host. Make that unmistakable in logs.
+    if (/whitelist|IP|ETIMEDOUT|querySrv|ENOTFOUND|selection timed out/i.test(err.message)) {
+      console.error(
+        '   ↳ Check MongoDB Atlas → Network Access. Render uses dynamic egress IPs,\n' +
+        '     so the allow-list usually needs 0.0.0.0/0 (or a paid static-IP setup).'
+      );
+    }
+
+    if (/Invalid scheme|Invalid connection string|must be a string/i.test(err.message)) {
+      console.error(
+        '   ↳ MONGODB_URI is malformed. On Render it must be the plain string\n' +
+        '     mongodb+srv://user:pass@cluster/... with NO surrounding quotes.'
+      );
+    }
+
+    const backoff = Math.min(MAX_BACKOFF_MS, 2000 * Math.pow(2, Math.min(connectAttempt - 1, 5)));
+    setTimeout(connectToDatabase, backoff).unref();
+    return false;
+  }
+};
+
+console.log(`🔌 Connecting to MongoDB (${maskUri(MONGODB_URI)})`);
+
+connectToDatabase();
+
+// Mongoose emits 'disconnected' before our retry kicks in — only nag once per state
+// so the logs stay readable.
+mongoose.connection.on('connected', () => {
+  mongoose.__lastConnectError = null;
+  console.log('✅ MongoDB connection established');
+});
+mongoose.connection.on('disconnected', () => console.warn('⚠️  MongoDB disconnected'));
 mongoose.connection.on('reconnected', () => console.log('✅ MongoDB reconnected'));
-mongoose.connection.on('error', (err) => console.error('❌ MongoDB error:', err.message));
+mongoose.connection.on('error', (err) => {
+  mongoose.__lastConnectError = err.message;
+  console.error('❌ MongoDB error:', err.message);
+});
 
 // ---------------------------------------------------------------------------
 // Process-level safety nets
