@@ -62,6 +62,15 @@ const errorHandler = (err, req, res, next) => {
     };
   }
 
+  // Mongoose buffering timeout — MongoDB is unreachable.
+  // Surfacing this as a clear 503 beats leaking the raw driver message.
+  if (err.name === 'MongooseError' && /buffering timed out/i.test(err.message || '')) {
+    error = {
+      message: 'Database unavailable. Please try again in a moment.',
+      status: 503
+    };
+  }
+
   if (err.code === 'LIMIT_UNEXPECTED_FILE') {
     error = {
       message: 'Too many files uploaded',

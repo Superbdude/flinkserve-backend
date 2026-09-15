@@ -154,12 +154,39 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use('/uploads', express.static('uploads'));
 
 // Health check endpoint
-app.get('/health', (req, res) => {
+// Always returns 200 so the platform keeps routing traffic, but the body
+// reports the true database state — this is the fastest way to tell whether a
+// 500 from an API route is caused by a bad MONGODB_URI / Atlas IP allow-list.
+const DB_STATES = ['disconnected', 'connected', 'connecting', 'disconnecting'];
+
+app.get('/health', async (req, res) => {
+  const dbState = DB_STATES[mongoose.connection.readyState] || 'unknown';
+
+  let dbPing = 'skipped';
+  if (mongoose.connection.readyState === 1) {
+    try {
+      await mongoose.connection.db.admin().ping();
+      dbPing = 'ok';
+    } catch (err) {
+      dbPing = `failed: ${err.message}`;
+    }
+  }
+
   res.status(200).json({
     status: 'OK',
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
-    environment: process.env.NODE_ENV
+    environment: process.env.NODE_ENV,
+    database: {
+      state: dbState,
+      ping: dbPing,
+      // Never expose credentials — host only.
+      host: mongoose.connection.host || null,
+      name: mongoose.connection.name || null,
+      // A missing host almost always means the Atlas IP allow-list is blocking
+      // this server, or MONGODB_URI is not set correctly on the host.
+      configured: Boolean(process.env.MONGODB_URI)
+    }
   });
 });
 
