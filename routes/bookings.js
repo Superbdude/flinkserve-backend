@@ -289,6 +289,90 @@ router.put('/:id/status', protect, authorize('service_provider'), [
   }
 });
 
+// @desc    Reschedule a booking (customer or provider)
+// @route   PUT /api/bookings/:id/reschedule
+// @access  Private (Customer or Provider of the booking)
+router.put('/:id/reschedule', protect, [
+  body('scheduledDate')
+    .isISO8601()
+    .withMessage('Valid scheduled date is required')
+    .custom((value) => {
+      if (new Date(value) <= new Date()) {
+        throw new Error('New scheduled date must be in the future');
+      }
+      return true;
+    }),
+  body('scheduledTime')
+    .optional()
+    .trim()
+    .isLength({ max: 20 })
+    .withMessage('Scheduled time cannot exceed 20 characters')
+], async (req, res, next) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Validation failed',
+        errors: errors.array()
+      });
+    }
+
+    const booking = await Booking.findById(req.params.id);
+    if (!booking) {
+      return res.status(404).json({
+        success: false,
+        message: 'Booking not found'
+      });
+    }
+
+    const isCustomer = booking.customer.toString() === req.user.id;
+    const isProvider = booking.provider.toString() === req.user.id;
+    if (!isCustomer && !isProvider) {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized to reschedule this booking'
+      });
+    }
+
+    if (['completed', 'cancelled'].includes(booking.status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot reschedule a ${booking.status} booking`
+      });
+    }
+
+    booking.scheduledDate = new Date(req.body.scheduledDate);
+    if (req.body.scheduledTime) {
+      booking.scheduledTime = req.body.scheduledTime;
+    }
+
+    // New time must be confirmed again
+    booking.status = 'pending';
+    booking.statusHistory.push({
+      status: 'pending',
+      note: `Rescheduled by ${isProvider ? 'provider' : 'customer'}`,
+      updatedBy: req.user.id
+    });
+
+    await booking.save();
+
+    await booking.populate([
+      { path: 'customer', select: 'name avatar phone email' },
+      { path: 'provider', select: 'name avatar phone email' },
+      { path: 'service', select: 'title category pricing images' }
+    ]);
+
+    res.status(200).json({
+      success: true,
+      message: 'Booking rescheduled — waiting for re-confirmation',
+      data: { booking }
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // @desc    Cancel booking
 // @route   PUT /api/bookings/:id/cancel
 // @access  Private (Customer or Provider)
